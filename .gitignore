@@ -1,0 +1,12 @@
+﻿## Build and Visual Studio artifacts
+[Bb]in/
+[Oo]bj/
+.vs/
+*.user
+*.suo
+
+## Exclude local test downloads
+*.pdf
+*.zip
+*.bin
+*.iso
