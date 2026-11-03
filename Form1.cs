@@ -19,6 +19,7 @@ namespace Rapid_Downloader
     {
         public DownloadInfo Info { get; set; } = new();
         public CancellationTokenSource? Cts { get; set; }
+        public int Percent { get; set; } = 0;
     }
 
     public partial class Form1 : Form
@@ -31,7 +32,7 @@ namespace Rapid_Downloader
         private readonly List<ListViewItem> _allDownloadItems = new();
         private string _currentCategoryFilter = "All Downloads";
 
-        // Context Menu Controls (Open File With removed)
+        // Context Menu Controls
         private ContextMenuStrip contextMenuDownloads = null!;
         private ToolStripMenuItem menuOpenFile = null!;
         private ToolStripMenuItem menuOpenFolder = null!;
@@ -42,7 +43,7 @@ namespace Rapid_Downloader
         private ToolStripMenuItem menuDelete = null!;
         private ToolStripMenuItem menuProperties = null!;
 
-        // Win32 API for native Windows Properties dialog
+        // Win32 API declarations for native Windows Properties dialog
         [DllImport("shell32.dll", CharSet = CharSet.Auto)]
         private static extern bool ShellExecuteEx(ref SHELLEXECUTEINFO lpExecInfo);
 
@@ -168,7 +169,6 @@ namespace Rapid_Downloader
             menuDelete = new ToolStripMenuItem("Delete", null, BtnDelete_Click);
             menuProperties = new ToolStripMenuItem("Properties", null, Context_Properties_Click);
 
-            // Cleanly organized context menu without 'Open File With'
             contextMenuDownloads.Items.AddRange(new ToolStripItem[]
             {
                 menuOpenFile,
@@ -274,6 +274,7 @@ namespace Rapid_Downloader
             }
 
             state.Cts?.Cancel();
+            state.Percent = 0;
 
             try
             {
@@ -386,16 +387,124 @@ namespace Rapid_Downloader
             taskListView.FullRowSelect = true;
             taskListView.GridLines = true;
 
+            taskListView.OwnerDraw = true;
+
+            typeof(ListView).InvokeMember("DoubleBuffered",
+                System.Reflection.BindingFlags.NonPublic |
+                System.Reflection.BindingFlags.Instance |
+                System.Reflection.BindingFlags.SetProperty,
+                null, taskListView, new object[] { true });
+
+            taskListView.DrawColumnHeader += TaskListView_DrawColumnHeader;
+            taskListView.DrawItem += (s, e) => { };
+            taskListView.DrawSubItem += TaskListView_DrawSubItem;
+
             taskListView.Columns.Clear();
-            taskListView.Columns.Add("File Name", 200);
+            taskListView.Columns.Add("File Name", 220);
             taskListView.Columns.Add("Size", 85);
-            taskListView.Columns.Add("Status", 100);
-            taskListView.Columns.Add("ETA", 80);
+            taskListView.Columns.Add("Status", 130);
+            taskListView.Columns.Add("ETA", 75);
             taskListView.Columns.Add("Speed Rate", 95);
             taskListView.Columns.Add("Added Date", 125);
 
             taskListView.DoubleClick += (s, e) => Context_OpenFile_Click(s, e);
             taskListView.Items.Clear();
+        }
+
+        private void TaskListView_DrawColumnHeader(object? sender, DrawListViewColumnHeaderEventArgs e)
+        {
+            e.DrawDefault = true;
+        }
+
+        private void TaskListView_DrawSubItem(object? sender, DrawListViewSubItemEventArgs e)
+        {
+            if (e.ColumnIndex != 2)
+            {
+                e.DrawDefault = true;
+                return;
+            }
+
+            Graphics g = e.Graphics;
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+
+            bool isSelected = e.Item?.Selected ?? false;
+            Color cellBg = isSelected ? SystemColors.Highlight : Color.White;
+            using (SolidBrush bgBrush = new SolidBrush(cellBg))
+            {
+                g.FillRectangle(bgBrush, e.Bounds);
+            }
+
+            Rectangle barRect = new Rectangle(
+                e.Bounds.X + 6,
+                e.Bounds.Y + 4,
+                e.Bounds.Width - 12,
+                e.Bounds.Height - 8
+            );
+
+            if (barRect.Width <= 0 || barRect.Height <= 0) return;
+
+            string statusText = e.SubItem?.Text ?? string.Empty;
+            int percent = 0;
+            if (e.Item?.Tag is DownloadItemState state)
+            {
+                percent = state.Percent;
+            }
+
+            Color fillColor = Color.FromArgb(0, 120, 215);
+            if (statusText == "Completed")
+            {
+                fillColor = Color.FromArgb(46, 160, 67);
+                percent = 100;
+            }
+            else if (statusText == "Stopped")
+            {
+                fillColor = Color.FromArgb(130, 140, 150);
+            }
+            else if (statusText == "Error")
+            {
+                fillColor = Color.FromArgb(220, 53, 69);
+            }
+
+            using (SolidBrush trackBrush = new SolidBrush(Color.FromArgb(238, 240, 243)))
+            {
+                using (Pen borderPen = new Pen(Color.FromArgb(205, 210, 218)))
+                {
+                    g.FillRectangle(trackBrush, barRect);
+
+                    string label = statusText;
+                    if (percent > 0 && percent < 100 && statusText != "Stopped" && statusText != "Error")
+                    {
+                        label = $"{percent}%";
+                    }
+
+                    using (Font font = new Font("Segoe UI", 8.25f, FontStyle.Bold))
+                    {
+                        TextRenderer.DrawText(g, label, font, barRect, Color.FromArgb(50, 50, 50),
+                            TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine);
+
+                        int fillWidth = (int)((barRect.Width - 2) * (Math.Clamp(percent, 0, 100) / 100.0));
+                        if (fillWidth > 0)
+                        {
+                            Rectangle fillRect = new Rectangle(barRect.X + 1, barRect.Y + 1, fillWidth, barRect.Height - 2);
+
+                            GraphicsState clipState = g.Save();
+                            g.SetClip(fillRect);
+
+                            using (SolidBrush fillBrush = new SolidBrush(fillColor))
+                            {
+                                g.FillRectangle(fillBrush, fillRect);
+                            }
+
+                            TextRenderer.DrawText(g, label, font, barRect, Color.White,
+                                TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine);
+
+                            g.Restore(clipState);
+                        }
+                    }
+
+                    g.DrawRectangle(borderPen, barRect);
+                }
+            }
         }
 
         private void AddIconButton(string text, string unicodeChar, Color iconColor, EventHandler? onClick)
@@ -429,15 +538,17 @@ namespace Rapid_Downloader
                 g.TextRenderingHint = TextRenderingHint.AntiAliasGridFit;
 
                 using (Font font = new Font(_iconFontFamily, iconSize * 0.75f, FontStyle.Regular, GraphicsUnit.Pixel))
-                using (Brush brush = new SolidBrush(iconColor))
                 {
-                    StringFormat sf = new StringFormat
+                    using (Brush brush = new SolidBrush(iconColor))
                     {
-                        Alignment = StringAlignment.Center,
-                        LineAlignment = StringAlignment.Center
-                    };
+                        StringFormat sf = new StringFormat
+                        {
+                            Alignment = StringAlignment.Center,
+                            LineAlignment = StringAlignment.Center
+                        };
 
-                    g.DrawString(unicodeGlyph, font, brush, new RectangleF(0, 0, iconSize, iconSize), sf);
+                        g.DrawString(unicodeGlyph, font, brush, new RectangleF(0, 0, iconSize, iconSize), sf);
+                    }
                 }
             }
 
@@ -447,10 +558,12 @@ namespace Rapid_Downloader
         private void BtnAdd_Click(object? sender, EventArgs e)
         {
             AppLogger.Info("[Toolbar] Add URL button clicked.");
-            using var addUrlDlg = new AddUrlForm();
-            if (addUrlDlg.ShowDialog(this) == DialogResult.OK && addUrlDlg.ResultDownloadInfo != null)
+            using (AddUrlForm addUrlDlg = new AddUrlForm())
             {
-                StartDownload(addUrlDlg.ResultDownloadInfo);
+                if (addUrlDlg.ShowDialog(this) == DialogResult.OK && addUrlDlg.ResultDownloadInfo != null)
+                {
+                    StartDownload(addUrlDlg.ResultDownloadInfo);
+                }
             }
         }
 
@@ -476,8 +589,9 @@ namespace Rapid_Downloader
 
         private void LaunchWorker(ListViewItem item, DownloadItemState state)
         {
-            state.Cts = new CancellationTokenSource();
-            CancellationToken token = state.Cts.Token;
+            CancellationTokenSource cts = new CancellationTokenSource();
+            state.Cts = cts;
+            CancellationToken token = cts.Token;
 
             _ = Task.Run(async () =>
             {
@@ -492,10 +606,10 @@ namespace Rapid_Downloader
                         existingBytes = new FileInfo(destinationPath).Length;
                     }
 
-                    // If already complete, finalize immediately
                     if (state.Info.TotalBytes > 0 && existingBytes == state.Info.TotalBytes)
                     {
                         AppLogger.Info($"[Download Verified] '{state.Info.FileName}' is already complete.");
+                        state.Percent = 100;
                         this.BeginInvoke(new Action(() =>
                         {
                             item.SubItems[2].Text = "Completed";
@@ -505,7 +619,6 @@ namespace Rapid_Downloader
                         return;
                     }
 
-                    // If existing file is larger than the total size or corrupted, truncate and restart
                     if (state.Info.TotalBytes > 0 && existingBytes > state.Info.TotalBytes)
                     {
                         AppLogger.Warn($"[Download Stream] Local file ({existingBytes} bytes) exceeds total size ({state.Info.TotalBytes} bytes). Resetting to 0.");
@@ -517,130 +630,143 @@ namespace Rapid_Downloader
                     {
                         AllowAutoRedirect = true,
                         AutomaticDecompression = DecompressionMethods.All,
-                        UseCookies = false // Ensures Cookie header is sent over the wire
+                        UseCookies = false
                     };
 
-                    using var client = new HttpClient(handler);
-
-                    if (!string.IsNullOrWhiteSpace(state.Info.UserAgent))
+                    using (HttpClient client = new HttpClient(handler))
                     {
-                        client.DefaultRequestHeaders.UserAgent.Clear();
-                        client.DefaultRequestHeaders.UserAgent.ParseAdd(state.Info.UserAgent);
-                    }
-                    else
-                    {
-                        AddUrlForm.ApplyBrowserHeaders(client);
-                    }
-
-                    using var request = new HttpRequestMessage(HttpMethod.Get, state.Info.Url);
-                    if (Uri.TryCreate(state.Info.Url, UriKind.Absolute, out Uri? parsedUri) && parsedUri != null)
-                    {
-                        request.Headers.Referrer = AddUrlForm.GetRefererUri(parsedUri);
-                    }
-
-                    if (!string.IsNullOrWhiteSpace(state.Info.Cookies))
-                    {
-                        request.Headers.TryAddWithoutValidation("Cookie", state.Info.Cookies);
-                    }
-
-                    if (existingBytes > 0)
-                    {
-                        request.Headers.Range = new RangeHeaderValue(existingBytes, null);
-                        AppLogger.Info($"[Download Stream] Requesting resume for '{state.Info.FileName}' from byte {existingBytes}");
-                    }
-                    else
-                    {
-                        AppLogger.Info($"[Download Stream] Starting download for '{state.Info.FileName}' from origin {state.Info.Url}");
-                    }
-
-                    var response = await client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, token);
-
-                    // Handle invalid range rejection (e.g. 416 or 403 on bad Range): retry from byte 0
-                    if (existingBytes > 0 && ((int)response.StatusCode == 416 || (int)response.StatusCode == 403))
-                    {
-                        AppLogger.Warn($"[Download Stream] Server rejected range request ({response.StatusCode}). Retrying fresh from byte 0...");
-                        response.Dispose();
-                        existingBytes = 0;
-                        try { File.Delete(destinationPath); } catch { }
-
-                        using var retryReq = new HttpRequestMessage(HttpMethod.Get, state.Info.Url);
-                        if (parsedUri != null) retryReq.Headers.Referrer = AddUrlForm.GetRefererUri(parsedUri);
-                        if (!string.IsNullOrWhiteSpace(state.Info.Cookies)) retryReq.Headers.TryAddWithoutValidation("Cookie", state.Info.Cookies);
-
-                        response = await client.SendAsync(retryReq, HttpCompletionOption.ResponseHeadersRead, token);
-                    }
-
-                    response.EnsureSuccessStatusCode();
-
-                    bool appendMode = (response.StatusCode == HttpStatusCode.PartialContent);
-                    if (!appendMode) existingBytes = 0;
-
-                    long? contentLen = response.Content.Headers.ContentLength;
-                    long totalBytes = appendMode ? (existingBytes + (contentLen ?? 0)) : (contentLen ?? state.Info.TotalBytes);
-
-                    if (state.Info.TotalBytes <= 0 && totalBytes > 0)
-                    {
-                        state.Info.TotalBytes = totalBytes;
-                        this.BeginInvoke(new Action(() =>
+                        if (!string.IsNullOrWhiteSpace(state.Info.UserAgent))
                         {
-                            item.SubItems[1].Text = FileInfoForm.FormatBytes(totalBytes);
-                        }));
-                        AppLogger.Info($"[Download Stream] Size resolved: {FileInfoForm.FormatBytes(totalBytes)}");
-                    }
-
-                    using var stream = await response.Content.ReadAsStreamAsync(token);
-                    using var fs = new FileStream(destinationPath, appendMode ? FileMode.Append : FileMode.Create, FileAccess.Write, FileShare.None);
-
-                    byte[] buffer = new byte[81920];
-                    long totalRead = existingBytes;
-                    int bytesRead;
-
-                    var stopwatch = Stopwatch.StartNew();
-                    long lastBytes = totalRead;
-                    var lastTime = stopwatch.ElapsedMilliseconds;
-
-                    while ((bytesRead = await stream.ReadAsync(buffer, 0, buffer.Length, token)) > 0)
-                    {
-                        await fs.WriteAsync(buffer, 0, bytesRead, token);
-                        totalRead += bytesRead;
-
-                        long now = stopwatch.ElapsedMilliseconds;
-                        if (now - lastTime >= 500)
+                            client.DefaultRequestHeaders.UserAgent.Clear();
+                            client.DefaultRequestHeaders.UserAgent.ParseAdd(state.Info.UserAgent);
+                        }
+                        else
                         {
-                            double intervalSec = (now - lastTime) / 1000.0;
-                            double speedBytesPerSec = (totalRead - lastBytes) / intervalSec;
+                            AddUrlForm.ApplyBrowserHeaders(client);
+                        }
 
-                            lastBytes = totalRead;
-                            lastTime = now;
-
-                            int percent = totalBytes > 0 ? (int)((totalRead * 100) / totalBytes) : 0;
-                            string etaStr = "--:--";
-                            if (totalBytes > 0 && speedBytesPerSec > 0)
+                        using (HttpRequestMessage request = new HttpRequestMessage(HttpMethod.Get, state.Info.Url))
+                        {
+                            if (Uri.TryCreate(state.Info.Url, UriKind.Absolute, out Uri? parsedUri) && parsedUri != null)
                             {
-                                long remaining = totalBytes - totalRead;
-                                var etaSpan = TimeSpan.FromSeconds(remaining / speedBytesPerSec);
-                                etaStr = etaSpan.TotalHours >= 1 ? etaSpan.ToString(@"hh\:mm\:ss") : etaSpan.ToString(@"mm\:ss");
+                                request.Headers.Referrer = AddUrlForm.GetRefererUri(parsedUri);
                             }
 
-                            string speedStr = $"{FileInfoForm.FormatBytes((long)speedBytesPerSec)}/s";
-
-                            this.BeginInvoke(new Action(() =>
+                            if (!string.IsNullOrWhiteSpace(state.Info.Cookies))
                             {
-                                item.SubItems[2].Text = totalBytes > 0 ? $"{percent}%" : "Downloading...";
-                                item.SubItems[3].Text = etaStr;
-                                item.SubItems[4].Text = speedStr;
-                            }));
+                                request.Headers.TryAddWithoutValidation("Cookie", state.Info.Cookies);
+                            }
+
+                            if (existingBytes > 0)
+                            {
+                                request.Headers.Range = new RangeHeaderValue(existingBytes, null);
+                                AppLogger.Info($"[Download Stream] Requesting resume for '{state.Info.FileName}' from byte {existingBytes}");
+                            }
+                            else
+                            {
+                                AppLogger.Info($"[Download Stream] Starting download for '{state.Info.FileName}' from origin {state.Info.Url}");
+                            }
+
+                            HttpResponseMessage response = await client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, token);
+
+                            if (existingBytes > 0 && ((int)response.StatusCode == 416 || (int)response.StatusCode == 403))
+                            {
+                                AppLogger.Warn($"[Download Stream] Server rejected range request ({response.StatusCode}). Retrying fresh from byte 0...");
+                                response.Dispose();
+                                existingBytes = 0;
+                                try { File.Delete(destinationPath); } catch { }
+
+                                using (HttpRequestMessage retryReq = new HttpRequestMessage(HttpMethod.Get, state.Info.Url))
+                                {
+                                    if (parsedUri != null) retryReq.Headers.Referrer = AddUrlForm.GetRefererUri(parsedUri);
+                                    if (!string.IsNullOrWhiteSpace(state.Info.Cookies)) retryReq.Headers.TryAddWithoutValidation("Cookie", state.Info.Cookies);
+
+                                    response = await client.SendAsync(retryReq, HttpCompletionOption.ResponseHeadersRead, token);
+                                }
+                            }
+
+                            using (response)
+                            {
+                                response.EnsureSuccessStatusCode();
+
+                                bool appendMode = (response.StatusCode == HttpStatusCode.PartialContent);
+                                if (!appendMode) existingBytes = 0;
+
+                                long? contentLen = response.Content.Headers.ContentLength;
+                                long totalBytes = appendMode ? (existingBytes + (contentLen ?? 0)) : (contentLen ?? state.Info.TotalBytes);
+
+                                if (state.Info.TotalBytes <= 0 && totalBytes > 0)
+                                {
+                                    state.Info.TotalBytes = totalBytes;
+                                    this.BeginInvoke(new Action(() =>
+                                    {
+                                        item.SubItems[1].Text = FileInfoForm.FormatBytes(totalBytes);
+                                    }));
+                                    AppLogger.Info($"[Download Stream] Size resolved: {FileInfoForm.FormatBytes(totalBytes)}");
+                                }
+
+                                using (Stream stream = await response.Content.ReadAsStreamAsync(token))
+                                {
+                                    using (FileStream fs = new FileStream(destinationPath, appendMode ? FileMode.Append : FileMode.Create, FileAccess.Write, FileShare.None))
+                                    {
+                                        byte[] buffer = new byte[81920];
+                                        long totalRead = existingBytes;
+                                        int bytesRead;
+
+                                        Stopwatch stopwatch = Stopwatch.StartNew();
+                                        long lastBytes = totalRead;
+                                        long lastTime = stopwatch.ElapsedMilliseconds;
+
+                                        while ((bytesRead = await stream.ReadAsync(buffer, 0, buffer.Length, token)) > 0)
+                                        {
+                                            await fs.WriteAsync(buffer, 0, bytesRead, token);
+                                            totalRead += bytesRead;
+
+                                            long now = stopwatch.ElapsedMilliseconds;
+                                            if (now - lastTime >= 500)
+                                            {
+                                                double intervalSec = (now - lastTime) / 1000.0;
+                                                double speedBytesPerSec = (totalRead - lastBytes) / intervalSec;
+
+                                                lastBytes = totalRead;
+                                                lastTime = now;
+
+                                                int percent = totalBytes > 0 ? (int)((totalRead * 100) / totalBytes) : 0;
+                                                state.Percent = percent;
+
+                                                string etaStr = "--:--";
+                                                if (totalBytes > 0 && speedBytesPerSec > 0)
+                                                {
+                                                    long remaining = totalBytes - totalRead;
+                                                    TimeSpan etaSpan = TimeSpan.FromSeconds(remaining / speedBytesPerSec);
+                                                    etaStr = etaSpan.TotalHours >= 1 ? etaSpan.ToString(@"hh\:mm\:ss") : etaSpan.ToString(@"mm\:ss");
+                                                }
+
+                                                string speedStr = $"{FileInfoForm.FormatBytes((long)speedBytesPerSec)}/s";
+
+                                                this.BeginInvoke(new Action(() =>
+                                                {
+                                                    item.SubItems[2].Text = totalBytes > 0 ? $"{percent}%" : "Downloading...";
+                                                    item.SubItems[3].Text = etaStr;
+                                                    item.SubItems[4].Text = speedStr;
+                                                }));
+                                            }
+                                        }
+
+                                        AppLogger.Info($"[Download Finished] '{state.Info.FileName}' completed -> '{destinationPath}'");
+                                        state.Percent = 100;
+
+                                        this.BeginInvoke(new Action(() =>
+                                        {
+                                            item.SubItems[2].Text = "Completed";
+                                            item.SubItems[3].Text = "00:00";
+                                            item.SubItems[4].Text = "--";
+                                        }));
+                                    }
+                                }
+                            }
                         }
                     }
-
-                    AppLogger.Info($"[Download Finished] '{state.Info.FileName}' completed -> '{destinationPath}'");
-
-                    this.BeginInvoke(new Action(() =>
-                    {
-                        item.SubItems[2].Text = "Completed";
-                        item.SubItems[3].Text = "00:00";
-                        item.SubItems[4].Text = "--";
-                    }));
                 }
                 catch (OperationCanceledException)
                 {
@@ -722,8 +848,10 @@ namespace Rapid_Downloader
         private void BtnAbout_Click(object? sender, EventArgs e)
         {
             AppLogger.Info("[UI Action] About window opened.");
-            using var aboutDlg = new AboutForm(this.Icon);
-            aboutDlg.ShowDialog(this);
+            using (AboutForm aboutDlg = new AboutForm(this.Icon))
+            {
+                aboutDlg.ShowDialog(this);
+            }
         }
 
         private void BtnLogs_Click(object? sender, EventArgs e)
@@ -733,7 +861,6 @@ namespace Rapid_Downloader
             logsForm.Show(this);
         }
 
-        // Unified Delete Action: Used by both Toolbar 'Delete' and Context Menu 'Delete'
         private void BtnDelete_Click(object? sender, EventArgs e)
         {
             HandleDeleteTask();
@@ -750,40 +877,42 @@ namespace Rapid_Downloader
             var selectedItem = taskListView.SelectedItems[0];
             if (selectedItem.Tag is not DownloadItemState state) return;
 
-            using var confirmDlg = new DeleteConfirmForm(state.Info.FileName, this.Icon);
-            if (confirmDlg.ShowDialog(this) == DialogResult.OK)
+            using (DeleteConfirmForm confirmDlg = new DeleteConfirmForm(state.Info.FileName, this.Icon))
             {
-                state.Cts?.Cancel();
-
-                if (confirmDlg.UserChoice == DeleteActionChoice.DeletePermanently)
+                if (confirmDlg.ShowDialog(this) == DialogResult.OK)
                 {
-                    try
+                    state.Cts?.Cancel();
+
+                    if (confirmDlg.UserChoice == DeleteActionChoice.DeletePermanently)
                     {
-                        if (File.Exists(state.Info.FullSavePath))
+                        try
                         {
-                            File.Delete(state.Info.FullSavePath);
-                            AppLogger.Info($"[Delete Permanently] Deleted file from disk: '{state.Info.FullSavePath}'");
+                            if (File.Exists(state.Info.FullSavePath))
+                            {
+                                File.Delete(state.Info.FullSavePath);
+                                AppLogger.Info($"[Delete Permanently] Deleted file from disk: '{state.Info.FullSavePath}'");
+                            }
                         }
+                        catch (Exception ex)
+                        {
+                            AppLogger.Error($"[Delete Permanently] Failed to remove file from disk: '{state.Info.FullSavePath}'", ex);
+                            MessageBox.Show($"Could not delete file from disk: {ex.Message}", "Delete Error", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                        }
+
+                        AppLogger.Info($"[Delete Permanently] Removed '{state.Info.FileName}' from download list and disk.");
                     }
-                    catch (Exception ex)
+                    else if (confirmDlg.UserChoice == DeleteActionChoice.RemoveFromListOnly)
                     {
-                        AppLogger.Error($"[Delete Permanently] Failed to remove file from disk: '{state.Info.FullSavePath}'", ex);
-                        MessageBox.Show($"Could not delete file from disk: {ex.Message}", "Delete Error", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                        AppLogger.Info($"[Delete List Only] Removed '{state.Info.FileName}' from download list. File kept on disk: '{state.Info.FullSavePath}'");
                     }
 
-                    AppLogger.Info($"[Delete Permanently] Removed '{state.Info.FileName}' from download list and disk.");
+                    _allDownloadItems.Remove(selectedItem);
+                    taskListView.Items.Remove(selectedItem);
                 }
-                else if (confirmDlg.UserChoice == DeleteActionChoice.RemoveFromListOnly)
+                else
                 {
-                    AppLogger.Info($"[Delete List Only] Removed '{state.Info.FileName}' from download list. File kept on disk: '{state.Info.FullSavePath}'");
+                    AppLogger.Info($"[Delete Action] Deletion cancelled for '{state.Info.FileName}'");
                 }
-
-                _allDownloadItems.Remove(selectedItem);
-                taskListView.Items.Remove(selectedItem);
-            }
-            else
-            {
-                AppLogger.Info($"[Delete Action] Deletion cancelled for '{state.Info.FileName}'");
             }
         }
 
@@ -819,25 +948,28 @@ namespace Rapid_Downloader
                 const int WM_PAINT = 0x000F;
                 if (m.Msg == WM_PAINT && _listView.IsHandleCreated && _listView.Visible && _listView.View == View.Details)
                 {
-                    using var g = Graphics.FromHwnd(_listView.Handle);
-                    using var pen = new Pen(Color.FromArgb(240, 240, 240));
-
-                    int clientHeight = _listView.ClientSize.Height;
-                    int clientWidth = _listView.ClientSize.Width;
-
-                    int currentX = 0;
-                    for (int i = 0; i < _listView.Columns.Count; i++)
+                    using (Graphics g = Graphics.FromHwnd(_listView.Handle))
                     {
-                        currentX += _listView.Columns[i].Width;
-                        g.DrawLine(pen, currentX - 1, 0, currentX - 1, clientHeight);
-                    }
-
-                    if (_listView.Items.Count == 0)
-                    {
-                        int rowHeight = 22;
-                        for (int y = rowHeight; y < clientHeight; y += rowHeight)
+                        using (Pen pen = new Pen(Color.FromArgb(240, 240, 240)))
                         {
-                            g.DrawLine(pen, 0, y, clientWidth, y);
+                            int clientHeight = _listView.ClientSize.Height;
+                            int clientWidth = _listView.ClientSize.Width;
+
+                            int currentX = 0;
+                            for (int i = 0; i < _listView.Columns.Count; i++)
+                            {
+                                currentX += _listView.Columns[i].Width;
+                                g.DrawLine(pen, currentX - 1, 0, currentX - 1, clientHeight);
+                            }
+
+                            if (_listView.Items.Count == 0)
+                            {
+                                int rowHeight = 22;
+                                for (int y = rowHeight; y < clientHeight; y += rowHeight)
+                                {
+                                    g.DrawLine(pen, 0, y, clientWidth, y);
+                                }
+                            }
                         }
                     }
                 }
