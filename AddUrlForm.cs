@@ -131,43 +131,18 @@ namespace Rapid_Downloader
 
                         if (string.IsNullOrWhiteSpace(resolvedName)) resolvedName = "downloaded_file.bin";
 
-                        // If WebView2 resolved the exact size directly from Chromium
-                        if (resolver.ResolvedTotalBytes > 0)
+                        info = new DownloadInfo
                         {
-                            info = new DownloadInfo
-                            {
-                                Url = uriResult.AbsoluteUri,
-                                FileName = resolvedName,
-                                TotalBytes = resolver.ResolvedTotalBytes,
-                                Category = CategorizeExtension(Path.GetExtension(resolvedName)),
-                                SaveDirectory = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "Downloads"),
-                                Cookies = resolver.ResolvedCookies,
-                                UserAgent = resolver.ResolvedUserAgent
-                            };
-                            AppLogger.Info($"[AddURL] Resolved via Chromium: '{info.FileName}' ({info.TotalBytes} bytes)");
-                        }
-                        else
-                        {
-                            // Secondary probe with manual Cookie injection (UseCookies = false)
-                            try
-                            {
-                                info = await FetchRemoteFileInfoAsync(uriResult, resolver.ResolvedCookies, resolver.ResolvedUserAgent);
-                            }
-                            catch (Exception secondaryEx)
-                            {
-                                AppLogger.Warn($"[AddURL] Secondary probe failed ({secondaryEx.Message}). Using URL fallback.");
-                                info = new DownloadInfo
-                                {
-                                    Url = uriResult.AbsoluteUri,
-                                    FileName = resolvedName,
-                                    TotalBytes = -1,
-                                    Category = CategorizeExtension(Path.GetExtension(resolvedName)),
-                                    SaveDirectory = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "Downloads"),
-                                    Cookies = resolver.ResolvedCookies,
-                                    UserAgent = resolver.ResolvedUserAgent
-                                };
-                            }
-                        }
+                            Url = uriResult.AbsoluteUri,
+                            FileName = resolvedName,
+                            TotalBytes = resolver.ResolvedTotalBytes,
+                            Category = CategorizeExtension(Path.GetExtension(resolvedName)),
+                            SaveDirectory = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "Downloads"),
+                            Cookies = resolver.ResolvedCookies,
+                            UserAgent = resolver.ResolvedUserAgent
+                        };
+
+                        AppLogger.Info($"[AddURL] Resolved via Chromium session: '{info.FileName}' ({FileInfoForm.FormatBytes(info.TotalBytes)})");
                     }
                     else
                     {

@@ -16,8 +16,10 @@ namespace Rapid_Downloader
         private System.Windows.Forms.Timer _pollTimer = null!;
         private readonly string _targetUrl;
         private bool _isCompleted = false;
+        private bool _navigationFinished = false;
         private int _postClearanceWaitTicks = 0;
 
+        public string FinalUrl { get; private set; } = string.Empty;
         public string ResolvedCookies { get; private set; } = string.Empty;
         public string ResolvedUserAgent { get; private set; } = string.Empty;
         public long ResolvedTotalBytes { get; private set; } = -1;
@@ -66,14 +68,26 @@ namespace Rapid_Downloader
             try
             {
                 AppLogger.Info("[WebView2] Initializing CoreWebView2 environment...");
-                await webView.EnsureCoreWebView2Async();
+                var env = await WebView2Helper.GetEnvironmentAsync();
+                await webView.EnsureCoreWebView2Async(env);
 
                 ResolvedUserAgent = webView.CoreWebView2.Settings.UserAgent;
                 AppLogger.Info($"[WebView2] Chromium User-Agent: {ResolvedUserAgent}");
 
+                webView.SourceChanged += (s, args) =>
+                {
+                    FinalUrl = webView.Source?.AbsoluteUri ?? string.Empty;
+                };
+
+                webView.CoreWebView2.NavigationCompleted += (s, args) =>
+                {
+                    _navigationFinished = true;
+                };
+
+                // Intercept download metadata directly from Chromium
                 webView.CoreWebView2.DownloadStarting += (s, args) =>
                 {
-                    args.Cancel = true; // Prevent WebView2 from writing the file internally
+                    args.Cancel = true; // Probe only; do not write to disk yet
 
                     string suggestedPath = !string.IsNullOrWhiteSpace(args.ResultFilePath)
                         ? args.ResultFilePath
@@ -81,13 +95,30 @@ namespace Rapid_Downloader
 
                     ResolvedFileName = Path.GetFileName(suggestedPath);
 
-                    if (args.DownloadOperation?.TotalBytesToReceive is ulong totalBytes and > 0)
+                    if (args.DownloadOperation?.TotalBytesToReceive is ulong totalBytes && totalBytes > 0)
                     {
                         ResolvedTotalBytes = (long)totalBytes;
                     }
 
                     AppLogger.Info($"[WebView2] Captured download info: '{ResolvedFileName}', Size: {ResolvedTotalBytes} bytes");
                     _ = ExtractCookiesAndFinishAsync();
+                };
+
+                // Intercept Content-Length header from network response
+                webView.CoreWebView2.WebResourceResponseReceived += (s, args) =>
+                {
+                    if (args.Response != null && (args.Response.StatusCode == 200 || args.Response.StatusCode == 206))
+                    {
+                        if (args.Response.Headers.Contains("Content-Length"))
+                        {
+                            string clStr = args.Response.Headers.GetHeader("Content-Length");
+                            if (long.TryParse(clStr, out long cl) && cl > 0 && ResolvedTotalBytes <= 0)
+                            {
+                                ResolvedTotalBytes = cl;
+                                AppLogger.Info($"[WebView2] Captured Content-Length header: {cl} bytes");
+                            }
+                        }
+                    }
                 };
 
                 _pollTimer.Start();
@@ -113,18 +144,18 @@ namespace Rapid_Downloader
 
                 if (cfCookie != null)
                 {
-                    // If DownloadStarting has already captured the metadata, finish immediately
+                    // If size has already been intercepted by DownloadStarting or headers, complete immediately
                     if (ResolvedTotalBytes > 0)
                     {
                         await ExtractCookiesAndFinishAsync();
                         return;
                     }
 
-                    // Otherwise, allow up to 2 seconds for DownloadStarting to fire
+                    // Otherwise, allow up to 3 seconds for response headers to arrive
                     _postClearanceWaitTicks++;
-                    if (_postClearanceWaitTicks >= 2)
+                    if (_postClearanceWaitTicks >= 3 || _navigationFinished)
                     {
-                        AppLogger.Info("[WebView2] cf_clearance verified. Proceeding to finish.");
+                        AppLogger.Info("[WebView2] cf_clearance verified and navigation settled.");
                         await ExtractCookiesAndFinishAsync();
                     }
                 }
@@ -142,7 +173,7 @@ namespace Rapid_Downloader
             {
                 var cookies = await webView.CoreWebView2.CookieManager.GetCookiesAsync(_targetUrl);
                 ResolvedCookies = string.Join("; ", cookies.Select(c => $"{c.Name}={c.Value}"));
-                AppLogger.Info($"[WebView2] Exported {cookies.Count} cookie(s). Verification complete.");
+                AppLogger.Info($"[WebView2] Exported {cookies.Count} cookie(s). Ready.");
 
                 this.BeginInvoke(new Action(() =>
                 {

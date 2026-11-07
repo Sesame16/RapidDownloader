@@ -5,19 +5,20 @@ using System.Drawing;
 using System.Drawing.Drawing2D;
 using System.Drawing.Text;
 using System.IO;
-using System.Net;
-using System.Net.Http;
-using System.Net.Http.Headers;
+using System.Linq;
 using System.Runtime.InteropServices;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Windows.Forms;
+using Microsoft.Web.WebView2.Core;
+using Microsoft.Web.WebView2.WinForms;
 
 namespace Rapid_Downloader
 {
     public class DownloadItemState
     {
         public DownloadInfo Info { get; set; } = new();
+        public CoreWebView2DownloadOperation? DownloadOperation { get; set; }
         public CancellationTokenSource? Cts { get; set; }
         public int Percent { get; set; } = 0;
     }
@@ -29,10 +30,12 @@ namespace Rapid_Downloader
         private ToolStrip? toolStripIcons;
         private ListViewGridDrawer? _gridDrawer;
 
+        private WebView2 _downloadEngine = null!;
+        private readonly Dictionary<string, (ListViewItem Item, DownloadItemState State)> _pendingTasks = new();
+
         private readonly List<ListViewItem> _allDownloadItems = new();
         private string _currentCategoryFilter = "All Downloads";
 
-        // Context Menu Controls
         private ContextMenuStrip contextMenuDownloads = null!;
         private ToolStripMenuItem menuOpenFile = null!;
         private ToolStripMenuItem menuOpenFolder = null!;
@@ -43,7 +46,6 @@ namespace Rapid_Downloader
         private ToolStripMenuItem menuDelete = null!;
         private ToolStripMenuItem menuProperties = null!;
 
-        // Win32 API declarations for native Windows Properties dialog
         [DllImport("shell32.dll", CharSet = CharSet.Auto)]
         private static extern bool ShellExecuteEx(ref SHELLEXECUTEINFO lpExecInfo);
 
@@ -79,7 +81,7 @@ namespace Rapid_Downloader
             InitializeComponent();
         }
 
-        private void Form1_Load(object? sender, EventArgs e)
+        private async void Form1_Load(object? sender, EventArgs e)
         {
             AppLogger.Info("[App] Rapid Downloader initializing...");
 
@@ -92,7 +94,215 @@ namespace Rapid_Downloader
 
             _gridDrawer = new ListViewGridDrawer(taskListView);
 
+            await InitializeBackgroundDownloadEngineAsync();
+
             AppLogger.Info("[App] Main window ready and listening for tasks.");
+        }
+
+        private async Task InitializeBackgroundDownloadEngineAsync()
+        {
+            try
+            {
+                _downloadEngine = new WebView2
+                {
+                    Size = new Size(200, 200),
+                    Location = new Point(-3500, -3500),
+                    Visible = true
+                };
+                this.Controls.Add(_downloadEngine);
+
+                var env = await WebView2Helper.GetEnvironmentAsync();
+                await _downloadEngine.EnsureCoreWebView2Async(env);
+
+                _downloadEngine.CoreWebView2.DownloadStarting += CoreWebView2_DownloadStarting;
+
+                _downloadEngine.CoreWebView2.NavigationStarting += (s, args) =>
+                {
+                    AppLogger.Info($"[WebView2 Engine] Navigation started: {args.Uri}");
+                };
+
+                _downloadEngine.CoreWebView2.NavigationCompleted += async (s, args) =>
+                {
+                    AppLogger.Info($"[WebView2 Engine] Navigation completed (Success={args.IsSuccess}, Status={args.HttpStatusCode})");
+
+                    // If the URL loaded as an inline document (PDF/Image) rather than triggering DownloadStarting,
+                    // trigger an anchor click to force Chromium's DownloadManager to take over.
+                    if (args.IsSuccess && (args.HttpStatusCode == 200 || args.HttpStatusCode == 0))
+                    {
+                        DownloadItemState? pendingState = null;
+                        lock (_pendingTasks)
+                        {
+                            if (_pendingTasks.Count > 0)
+                            {
+                                pendingState = _pendingTasks.Values.FirstOrDefault().State;
+                            }
+                        }
+
+                        if (pendingState != null && pendingState.DownloadOperation == null)
+                        {
+                            AppLogger.Info($"[WebView2 Engine] Document loaded inline. Triggering download handler for '{pendingState.Info.FileName}'...");
+
+                            string script = $@"
+                        (() => {{
+                            try {{
+                                let a = document.createElement('a');
+                                a.href = window.location.href;
+                                a.setAttribute('download', '{pendingState.Info.FileName}');
+                                document.body.appendChild(a);
+                                a.click();
+                                a.remove();
+                            }} catch(e) {{}}
+                        }})();";
+
+                            await _downloadEngine.CoreWebView2.ExecuteScriptAsync(script);
+                        }
+                    }
+                };
+
+                AppLogger.Info("[WebView2 Engine] Shared background download engine ready.");
+            }
+            catch (Exception ex)
+            {
+                AppLogger.Error("[WebView2 Engine] Background engine initialization failed", ex);
+            }
+        }
+
+        private void CoreWebView2_DownloadStarting(object? sender, CoreWebView2DownloadStartingEventArgs e)
+        {
+            e.Handled = true; // Suppress Edge's default UI
+
+            string uri = e.DownloadOperation.Uri;
+            AppLogger.Info($"[WebView2 Download] Intercepted stream for: {uri}");
+
+            ListViewItem? item = null;
+            DownloadItemState? state = null;
+
+            lock (_pendingTasks)
+            {
+                // 1. Direct match
+                if (_pendingTasks.TryGetValue(uri, out var match))
+                {
+                    item = match.Item;
+                    state = match.State;
+                    _pendingTasks.Remove(uri);
+                }
+                else
+                {
+                    // 2. Redirect / substring match
+                    var key = _pendingTasks.Keys.FirstOrDefault(k =>
+                        uri.StartsWith(k, StringComparison.OrdinalIgnoreCase) ||
+                        k.StartsWith(uri, StringComparison.OrdinalIgnoreCase) ||
+                        uri.Contains(Path.GetFileNameWithoutExtension(k), StringComparison.OrdinalIgnoreCase));
+
+                    if (key != null)
+                    {
+                        var fallbackMatch = _pendingTasks[key];
+                        item = fallbackMatch.Item;
+                        state = fallbackMatch.State;
+                        _pendingTasks.Remove(key);
+                    }
+                    else if (_pendingTasks.Count > 0)
+                    {
+                        // 3. FIFO fallback for single active downloads
+                        var firstKey = _pendingTasks.Keys.First();
+                        var fallbackMatch = _pendingTasks[firstKey];
+                        item = fallbackMatch.Item;
+                        state = fallbackMatch.State;
+                        _pendingTasks.Remove(firstKey);
+                    }
+                }
+            }
+
+            if (item == null || state == null)
+            {
+                AppLogger.Warn($"[WebView2 Download] No corresponding UI item found for: {uri}");
+                return;
+            }
+
+            e.ResultFilePath = state.Info.FullSavePath;
+            state.DownloadOperation = e.DownloadOperation;
+
+            AppLogger.Info($"[WebView2 Download] Saving '{state.Info.FileName}' to '{e.ResultFilePath}'");
+
+            var download = e.DownloadOperation;
+            var stopwatch = Stopwatch.StartNew();
+            long lastBytes = 0;
+            long lastTime = 0;
+
+            download.BytesReceivedChanged += (s, args) =>
+            {
+                long received = (long)download.BytesReceived;
+                long? total = (long?)download.TotalBytesToReceive;
+
+                if (state.Info.TotalBytes <= 0 && total.HasValue && total.Value > 0)
+                {
+                    state.Info.TotalBytes = total.Value;
+                    this.BeginInvoke(new Action(() =>
+                    {
+                        item.SubItems[1].Text = FileInfoForm.FormatBytes(total.Value);
+                    }));
+                }
+
+                long now = stopwatch.ElapsedMilliseconds;
+                if (now - lastTime >= 500)
+                {
+                    double intervalSec = (now - lastTime) / 1000.0;
+                    double speedBytesPerSec = (received - lastBytes) / intervalSec;
+
+                    lastBytes = received;
+                    lastTime = now;
+
+                    int percent = total.HasValue && total.Value > 0
+                        ? (int)((received * 100) / total.Value)
+                        : 0;
+
+                    state.Percent = percent;
+
+                    string etaStr = "--:--";
+                    if (total.HasValue && total.Value > 0 && speedBytesPerSec > 0)
+                    {
+                        long remaining = total.Value - received;
+                        var eta = TimeSpan.FromSeconds(remaining / speedBytesPerSec);
+                        etaStr = eta.TotalHours >= 1 ? eta.ToString(@"hh\:mm\:ss") : eta.ToString(@"mm\:ss");
+                    }
+
+                    string speedStr = $"{FileInfoForm.FormatBytes((long)speedBytesPerSec)}/s";
+
+                    this.BeginInvoke(new Action(() =>
+                    {
+                        item.SubItems[2].Text = total.HasValue ? $"{percent}%" : "Downloading...";
+                        item.SubItems[3].Text = etaStr;
+                        item.SubItems[4].Text = speedStr;
+                    }));
+                }
+            };
+
+            download.StateChanged += (s, args) =>
+            {
+                switch (download.State)
+                {
+                    case CoreWebView2DownloadState.Completed:
+                        state.Percent = 100;
+                        AppLogger.Info($"[WebView2 Download] '{state.Info.FileName}' completed successfully.");
+                        this.BeginInvoke(new Action(() =>
+                        {
+                            item.SubItems[2].Text = "Completed";
+                            item.SubItems[3].Text = "00:00";
+                            item.SubItems[4].Text = "--";
+                        }));
+                        break;
+
+                    case CoreWebView2DownloadState.Interrupted:
+                        AppLogger.Warn($"[WebView2 Download] '{state.Info.FileName}' interrupted. Reason: {download.InterruptReason}");
+                        this.BeginInvoke(new Action(() =>
+                        {
+                            item.SubItems[2].Text = "Stopped";
+                            item.SubItems[3].Text = "--:--";
+                            item.SubItems[4].Text = "0 KB/s";
+                        }));
+                        break;
+                }
+            };
         }
 
         private void ApplyApplicationIcon()
@@ -267,12 +477,9 @@ namespace Rapid_Downloader
                 MessageBoxButtons.YesNo,
                 MessageBoxIcon.Question);
 
-            if (confirm != DialogResult.Yes)
-            {
-                AppLogger.Info($"[Download Action] Refresh cancelled for '{state.Info.FileName}'");
-                return;
-            }
+            if (confirm != DialogResult.Yes) return;
 
+            state.DownloadOperation?.Cancel();
             state.Cts?.Cancel();
             state.Percent = 0;
 
@@ -281,19 +488,19 @@ namespace Rapid_Downloader
                 if (File.Exists(state.Info.FullSavePath))
                 {
                     File.Delete(state.Info.FullSavePath);
-                    AppLogger.Info($"[Download Action] Truncated/deleted previous file on disk: '{state.Info.FullSavePath}'");
                 }
             }
-            catch (Exception ex)
-            {
-                AppLogger.Warn($"[Download Action] Could not delete old file prior to refresh: {ex.Message}");
-            }
+            catch { }
 
             selectedItem.SubItems[2].Text = "Restarting...";
             selectedItem.SubItems[3].Text = "--:--";
             selectedItem.SubItems[4].Text = "0 KB/s";
 
-            LaunchWorker(selectedItem, state);
+            lock (_pendingTasks)
+            {
+                _pendingTasks[state.Info.Url] = (selectedItem, state);
+            }
+            _downloadEngine.CoreWebView2.Navigate(state.Info.Url);
         }
 
         private void Context_CopyUrl_Click(object? sender, EventArgs e)
@@ -309,8 +516,6 @@ namespace Rapid_Downloader
         {
             if (taskListView.SelectedItems.Count == 0) return;
             if (taskListView.SelectedItems[0].Tag is not DownloadItemState state) return;
-
-            AppLogger.Info($"[Shell Action] Properties dialog requested for '{state.Info.FileName}'");
 
             if (!File.Exists(state.Info.FullSavePath))
             {
@@ -357,7 +562,6 @@ namespace Rapid_Downloader
         {
             if (e.Node == null) return;
             _currentCategoryFilter = e.Node.Text;
-            AppLogger.Info($"[Categories] Filter switched to: '{_currentCategoryFilter}'");
             ApplyCategoryFilter();
         }
 
@@ -584,240 +788,46 @@ namespace Rapid_Downloader
             _allDownloadItems.Add(item);
             ApplyCategoryFilter();
 
-            LaunchWorker(item, state);
-        }
-
-        private void LaunchWorker(ListViewItem item, DownloadItemState state)
-        {
-            CancellationTokenSource cts = new CancellationTokenSource();
-            state.Cts = cts;
-            CancellationToken token = cts.Token;
-
-            _ = Task.Run(async () =>
+            // Synchronize cookies
+            if (!string.IsNullOrWhiteSpace(info.Cookies) && Uri.TryCreate(info.Url, UriKind.Absolute, out Uri? uri) && uri != null)
             {
-                try
+                var cookieManager = _downloadEngine.CoreWebView2.CookieManager;
+                var cookiePairs = info.Cookies.Split(';', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+                foreach (var pair in cookiePairs)
                 {
-                    Directory.CreateDirectory(state.Info.SaveDirectory);
-                    string destinationPath = state.Info.FullSavePath;
-
-                    long existingBytes = 0;
-                    if (File.Exists(destinationPath))
+                    var parts = pair.Split('=', 2);
+                    if (parts.Length == 2)
                     {
-                        existingBytes = new FileInfo(destinationPath).Length;
-                    }
-
-                    if (state.Info.TotalBytes > 0 && existingBytes == state.Info.TotalBytes)
-                    {
-                        AppLogger.Info($"[Download Verified] '{state.Info.FileName}' is already complete.");
-                        state.Percent = 100;
-                        this.BeginInvoke(new Action(() =>
-                        {
-                            item.SubItems[2].Text = "Completed";
-                            item.SubItems[3].Text = "00:00";
-                            item.SubItems[4].Text = "--";
-                        }));
-                        return;
-                    }
-
-                    if (state.Info.TotalBytes > 0 && existingBytes > state.Info.TotalBytes)
-                    {
-                        AppLogger.Warn($"[Download Stream] Local file ({existingBytes} bytes) exceeds total size ({state.Info.TotalBytes} bytes). Resetting to 0.");
-                        existingBytes = 0;
-                        try { File.Delete(destinationPath); } catch { }
-                    }
-
-                    var handler = new HttpClientHandler
-                    {
-                        AllowAutoRedirect = true,
-                        AutomaticDecompression = DecompressionMethods.All,
-                        UseCookies = false
-                    };
-
-                    using (HttpClient client = new HttpClient(handler))
-                    {
-                        if (!string.IsNullOrWhiteSpace(state.Info.UserAgent))
-                        {
-                            client.DefaultRequestHeaders.UserAgent.Clear();
-                            client.DefaultRequestHeaders.UserAgent.ParseAdd(state.Info.UserAgent);
-                        }
-                        else
-                        {
-                            AddUrlForm.ApplyBrowserHeaders(client);
-                        }
-
-                        using (HttpRequestMessage request = new HttpRequestMessage(HttpMethod.Get, state.Info.Url))
-                        {
-                            if (Uri.TryCreate(state.Info.Url, UriKind.Absolute, out Uri? parsedUri) && parsedUri != null)
-                            {
-                                request.Headers.Referrer = AddUrlForm.GetRefererUri(parsedUri);
-                            }
-
-                            if (!string.IsNullOrWhiteSpace(state.Info.Cookies))
-                            {
-                                request.Headers.TryAddWithoutValidation("Cookie", state.Info.Cookies);
-                            }
-
-                            if (existingBytes > 0)
-                            {
-                                request.Headers.Range = new RangeHeaderValue(existingBytes, null);
-                                AppLogger.Info($"[Download Stream] Requesting resume for '{state.Info.FileName}' from byte {existingBytes}");
-                            }
-                            else
-                            {
-                                AppLogger.Info($"[Download Stream] Starting download for '{state.Info.FileName}' from origin {state.Info.Url}");
-                            }
-
-                            HttpResponseMessage response = await client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, token);
-
-                            if (existingBytes > 0 && ((int)response.StatusCode == 416 || (int)response.StatusCode == 403))
-                            {
-                                AppLogger.Warn($"[Download Stream] Server rejected range request ({response.StatusCode}). Retrying fresh from byte 0...");
-                                response.Dispose();
-                                existingBytes = 0;
-                                try { File.Delete(destinationPath); } catch { }
-
-                                using (HttpRequestMessage retryReq = new HttpRequestMessage(HttpMethod.Get, state.Info.Url))
-                                {
-                                    if (parsedUri != null) retryReq.Headers.Referrer = AddUrlForm.GetRefererUri(parsedUri);
-                                    if (!string.IsNullOrWhiteSpace(state.Info.Cookies)) retryReq.Headers.TryAddWithoutValidation("Cookie", state.Info.Cookies);
-
-                                    response = await client.SendAsync(retryReq, HttpCompletionOption.ResponseHeadersRead, token);
-                                }
-                            }
-
-                            using (response)
-                            {
-                                response.EnsureSuccessStatusCode();
-
-                                bool appendMode = (response.StatusCode == HttpStatusCode.PartialContent);
-                                if (!appendMode) existingBytes = 0;
-
-                                long? contentLen = response.Content.Headers.ContentLength;
-                                long totalBytes = appendMode ? (existingBytes + (contentLen ?? 0)) : (contentLen ?? state.Info.TotalBytes);
-
-                                if (state.Info.TotalBytes <= 0 && totalBytes > 0)
-                                {
-                                    state.Info.TotalBytes = totalBytes;
-                                    this.BeginInvoke(new Action(() =>
-                                    {
-                                        item.SubItems[1].Text = FileInfoForm.FormatBytes(totalBytes);
-                                    }));
-                                    AppLogger.Info($"[Download Stream] Size resolved: {FileInfoForm.FormatBytes(totalBytes)}");
-                                }
-
-                                using (Stream stream = await response.Content.ReadAsStreamAsync(token))
-                                {
-                                    using (FileStream fs = new FileStream(destinationPath, appendMode ? FileMode.Append : FileMode.Create, FileAccess.Write, FileShare.None))
-                                    {
-                                        byte[] buffer = new byte[81920];
-                                        long totalRead = existingBytes;
-                                        int bytesRead;
-
-                                        Stopwatch stopwatch = Stopwatch.StartNew();
-                                        long lastBytes = totalRead;
-                                        long lastTime = stopwatch.ElapsedMilliseconds;
-
-                                        while ((bytesRead = await stream.ReadAsync(buffer, 0, buffer.Length, token)) > 0)
-                                        {
-                                            await fs.WriteAsync(buffer, 0, bytesRead, token);
-                                            totalRead += bytesRead;
-
-                                            long now = stopwatch.ElapsedMilliseconds;
-                                            if (now - lastTime >= 500)
-                                            {
-                                                double intervalSec = (now - lastTime) / 1000.0;
-                                                double speedBytesPerSec = (totalRead - lastBytes) / intervalSec;
-
-                                                lastBytes = totalRead;
-                                                lastTime = now;
-
-                                                int percent = totalBytes > 0 ? (int)((totalRead * 100) / totalBytes) : 0;
-                                                state.Percent = percent;
-
-                                                string etaStr = "--:--";
-                                                if (totalBytes > 0 && speedBytesPerSec > 0)
-                                                {
-                                                    long remaining = totalBytes - totalRead;
-                                                    TimeSpan etaSpan = TimeSpan.FromSeconds(remaining / speedBytesPerSec);
-                                                    etaStr = etaSpan.TotalHours >= 1 ? etaSpan.ToString(@"hh\:mm\:ss") : etaSpan.ToString(@"mm\:ss");
-                                                }
-
-                                                string speedStr = $"{FileInfoForm.FormatBytes((long)speedBytesPerSec)}/s";
-
-                                                this.BeginInvoke(new Action(() =>
-                                                {
-                                                    item.SubItems[2].Text = totalBytes > 0 ? $"{percent}%" : "Downloading...";
-                                                    item.SubItems[3].Text = etaStr;
-                                                    item.SubItems[4].Text = speedStr;
-                                                }));
-                                            }
-                                        }
-
-                                        AppLogger.Info($"[Download Finished] '{state.Info.FileName}' completed -> '{destinationPath}'");
-                                        state.Percent = 100;
-
-                                        this.BeginInvoke(new Action(() =>
-                                        {
-                                            item.SubItems[2].Text = "Completed";
-                                            item.SubItems[3].Text = "00:00";
-                                            item.SubItems[4].Text = "--";
-                                        }));
-                                    }
-                                }
-                            }
-                        }
+                        var cookie = cookieManager.CreateCookie(parts[0].Trim(), parts[1].Trim(), uri.Host, "/");
+                        cookieManager.AddOrUpdateCookie(cookie);
                     }
                 }
-                catch (OperationCanceledException)
-                {
-                    AppLogger.Info($"[Download Paused] '{state.Info.FileName}' paused.");
-                    this.BeginInvoke(new Action(() =>
-                    {
-                        item.SubItems[2].Text = "Stopped";
-                        item.SubItems[3].Text = "--:--";
-                        item.SubItems[4].Text = "0 KB/s";
-                    }));
-                }
-                catch (Exception ex)
-                {
-                    AppLogger.Error($"[Download Failed] '{state.Info.FileName}' error", ex);
-                    this.BeginInvoke(new Action(() =>
-                    {
-                        item.SubItems[2].Text = "Error";
-                        item.SubItems[3].Text = "--:--";
-                        item.SubItems[4].Text = "--";
-                    }));
-                    MessageBox.Show($"Download failed: {ex.Message}", "Download Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
-                }
-            });
+            }
+
+            lock (_pendingTasks)
+            {
+                _pendingTasks[info.Url] = (item, state);
+            }
+
+            AppLogger.Info($"[WebView2 Engine] Instructing engine to download: {info.Url}");
+            _downloadEngine.CoreWebView2.Navigate(info.Url);
         }
 
         private void BtnResume_Click(object? sender, EventArgs e)
         {
-            if (taskListView.SelectedItems.Count == 0)
-            {
-                MessageBox.Show("Please select a download task to resume.", "Resume Download", MessageBoxButtons.OK, MessageBoxIcon.Information);
-                return;
-            }
+            if (taskListView.SelectedItems.Count == 0) return;
 
             var selectedItem = taskListView.SelectedItems[0];
-            if (selectedItem.Tag is DownloadItemState state)
+            if (selectedItem.Tag is DownloadItemState state && state.DownloadOperation != null)
             {
-                string status = selectedItem.SubItems[2].Text;
-                if (status == "Completed")
-                {
-                    MessageBox.Show("This download is already completed.", "Resume", MessageBoxButtons.OK, MessageBoxIcon.Information);
-                    return;
-                }
+                if (state.DownloadOperation.State == CoreWebView2DownloadState.Completed) return;
 
-                if (status.Contains("%") || status == "Downloading..." || status == "Connecting...")
+                if (state.DownloadOperation.State == CoreWebView2DownloadState.Interrupted)
                 {
-                    return;
+                    AppLogger.Info($"[Download Action] Resuming task: '{state.Info.FileName}'");
+                    selectedItem.SubItems[2].Text = "Resuming...";
+                    state.DownloadOperation.Resume();
                 }
-
-                AppLogger.Info($"[Download Action] Resuming task: '{state.Info.FileName}'");
-                selectedItem.SubItems[2].Text = "Resuming...";
-                LaunchWorker(selectedItem, state);
             }
         }
 
@@ -826,10 +836,13 @@ namespace Rapid_Downloader
             if (taskListView.SelectedItems.Count == 0) return;
 
             var selectedItem = taskListView.SelectedItems[0];
-            if (selectedItem.Tag is DownloadItemState state)
+            if (selectedItem.Tag is DownloadItemState state && state.DownloadOperation != null)
             {
-                AppLogger.Info($"[Download Action] Stopping task: '{state.Info.FileName}'");
-                state.Cts?.Cancel();
+                if (state.DownloadOperation.State == CoreWebView2DownloadState.InProgress)
+                {
+                    AppLogger.Info($"[Download Action] Pausing task: '{state.Info.FileName}'");
+                    state.DownloadOperation.Pause();
+                }
             }
         }
 
@@ -838,16 +851,18 @@ namespace Rapid_Downloader
             AppLogger.Info($"[Download Action] Stop All triggered across {_allDownloadItems.Count} total task(s).");
             foreach (var item in _allDownloadItems)
             {
-                if (item.Tag is DownloadItemState state)
+                if (item.Tag is DownloadItemState state && state.DownloadOperation != null)
                 {
-                    state.Cts?.Cancel();
+                    if (state.DownloadOperation.State == CoreWebView2DownloadState.InProgress)
+                    {
+                        state.DownloadOperation.Pause();
+                    }
                 }
             }
         }
 
         private void BtnAbout_Click(object? sender, EventArgs e)
         {
-            AppLogger.Info("[UI Action] About window opened.");
             using (AboutForm aboutDlg = new AboutForm(this.Icon))
             {
                 aboutDlg.ShowDialog(this);
@@ -856,7 +871,6 @@ namespace Rapid_Downloader
 
         private void BtnLogs_Click(object? sender, EventArgs e)
         {
-            AppLogger.Info("[UI Action] Logs window opened.");
             var logsForm = new LogsForm(this.Icon);
             logsForm.Show(this);
         }
@@ -868,11 +882,7 @@ namespace Rapid_Downloader
 
         private void HandleDeleteTask()
         {
-            if (taskListView.SelectedItems.Count == 0)
-            {
-                MessageBox.Show("Please select a download item to delete.", "Delete Download", MessageBoxButtons.OK, MessageBoxIcon.Information);
-                return;
-            }
+            if (taskListView.SelectedItems.Count == 0) return;
 
             var selectedItem = taskListView.SelectedItems[0];
             if (selectedItem.Tag is not DownloadItemState state) return;
@@ -881,6 +891,10 @@ namespace Rapid_Downloader
             {
                 if (confirmDlg.ShowDialog(this) == DialogResult.OK)
                 {
+                    if (state.DownloadOperation != null && state.DownloadOperation.State == CoreWebView2DownloadState.InProgress)
+                    {
+                        state.DownloadOperation.Cancel();
+                    }
                     state.Cts?.Cancel();
 
                     if (confirmDlg.UserChoice == DeleteActionChoice.DeletePermanently)
@@ -890,42 +904,30 @@ namespace Rapid_Downloader
                             if (File.Exists(state.Info.FullSavePath))
                             {
                                 File.Delete(state.Info.FullSavePath);
-                                AppLogger.Info($"[Delete Permanently] Deleted file from disk: '{state.Info.FullSavePath}'");
+                                AppLogger.Info($"[Delete Permanently] Deleted file: '{state.Info.FullSavePath}'");
                             }
                         }
                         catch (Exception ex)
                         {
-                            AppLogger.Error($"[Delete Permanently] Failed to remove file from disk: '{state.Info.FullSavePath}'", ex);
-                            MessageBox.Show($"Could not delete file from disk: {ex.Message}", "Delete Error", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                            AppLogger.Error($"[Delete Permanently] Error deleting file: {ex.Message}");
                         }
-
-                        AppLogger.Info($"[Delete Permanently] Removed '{state.Info.FileName}' from download list and disk.");
-                    }
-                    else if (confirmDlg.UserChoice == DeleteActionChoice.RemoveFromListOnly)
-                    {
-                        AppLogger.Info($"[Delete List Only] Removed '{state.Info.FileName}' from download list. File kept on disk: '{state.Info.FullSavePath}'");
                     }
 
                     _allDownloadItems.Remove(selectedItem);
                     taskListView.Items.Remove(selectedItem);
-                }
-                else
-                {
-                    AppLogger.Info($"[Delete Action] Deletion cancelled for '{state.Info.FileName}'");
                 }
             }
         }
 
         private void BtnOptions_Click(object? sender, EventArgs e)
         {
-            AppLogger.Info("[UI Action] Options dialog clicked.");
             MessageBox.Show("Configuration dialog triggered", "Options");
         }
 
         protected override void OnFormClosed(FormClosedEventArgs e)
         {
-            AppLogger.Info("[App] Rapid Downloader closing. Cancelling all workers and releasing resources...");
             BtnStopAll_Click(null, EventArgs.Empty);
+            _downloadEngine?.Dispose();
             _gridDrawer?.ReleaseHandle();
             _fontCollection.Dispose();
             base.OnFormClosed(e);
