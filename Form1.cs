@@ -496,11 +496,10 @@ namespace Rapid_Downloader
             selectedItem.SubItems[3].Text = "--:--";
             selectedItem.SubItems[4].Text = "0 KB/s";
 
-            lock (_pendingTasks)
-            {
-                _pendingTasks[state.Info.Url] = (selectedItem, state);
-            }
-            _downloadEngine.CoreWebView2.Navigate(state.Info.Url);
+            if (string.IsNullOrWhiteSpace(state.Info.Cookies))
+                LaunchSegmentedWorker(selectedItem, state);
+            else
+                LaunchWebView2Download(selectedItem, state);
         }
 
         private void Context_CopyUrl_Click(object? sender, EventArgs e)
@@ -543,11 +542,15 @@ namespace Rapid_Downloader
             treeViewCategories.Nodes.Clear();
 
             TreeNode rootNode = new TreeNode("All Downloads");
-            rootNode.Nodes.Add("Documents");
-            rootNode.Nodes.Add("Media");
-            rootNode.Nodes.Add("Applications");
-            rootNode.Nodes.Add("Archived");
-            rootNode.Nodes.Add("Others");
+
+            // Populate child category nodes dynamically from user settings
+            foreach (var cat in AppSettings.Current.Categories)
+            {
+                if (cat.Name != "All Downloads")
+                {
+                    rootNode.Nodes.Add(cat.Name);
+                }
+            }
 
             treeViewCategories.Nodes.Add(rootNode);
             rootNode.Expand();
@@ -788,7 +791,67 @@ namespace Rapid_Downloader
             _allDownloadItems.Add(item);
             ApplyCategoryFilter();
 
-            // Synchronize cookies
+            // Direct URLs without Cloudflare cookies use parallel segmented downloading;
+            // Cloudflare-cleared URLs stream through WebView2's verified Chromium engine.
+            if (string.IsNullOrWhiteSpace(info.Cookies))
+            {
+                LaunchSegmentedWorker(item, state);
+            }
+            else
+            {
+                LaunchWebView2Download(item, state);
+            }
+        }
+
+        private void LaunchSegmentedWorker(ListViewItem item, DownloadItemState state)
+        {
+            state.Cts?.Cancel();
+            state.Cts = new CancellationTokenSource();
+            var token = state.Cts.Token;
+
+            var worker = new SegmentedDownloadWorker(
+                state.Info,
+                onProgress: (percent, totalBytes, etaStr, speedStr) =>
+                {
+                    state.Percent = percent;
+                    if (state.Info.TotalBytes <= 0 && totalBytes > 0)
+                    {
+                        state.Info.TotalBytes = totalBytes;
+                    }
+
+                    this.BeginInvoke(new Action(() =>
+                    {
+                        if (totalBytes > 0 && item.SubItems[1].Text == "Unknown")
+                            item.SubItems[1].Text = FileInfoForm.FormatBytes(totalBytes);
+
+                        item.SubItems[2].Text = totalBytes > 0 ? $"{percent}%" : "Downloading...";
+                        item.SubItems[3].Text = etaStr;
+                        item.SubItems[4].Text = speedStr;
+                    }));
+                },
+                onCompleted: (success, statusLabel) =>
+                {
+                    if (success) state.Percent = 100;
+                    this.BeginInvoke(new Action(() =>
+                    {
+                        item.SubItems[2].Text = statusLabel;
+                        item.SubItems[3].Text = success ? "00:00" : "--:--";
+                        item.SubItems[4].Text = success ? "--" : "0 KB/s";
+                    }));
+                },
+                onFallbackToWebView2: () =>
+                {
+                    this.BeginInvoke(new Action(() => LaunchWebView2Download(item, state)));
+                    return Task.CompletedTask;
+                });
+
+            _ = Task.Run(() => worker.RunAsync(token), token);
+        }
+
+        private void LaunchWebView2Download(ListViewItem item, DownloadItemState state)
+        {
+            var info = state.Info;
+
             if (!string.IsNullOrWhiteSpace(info.Cookies) && Uri.TryCreate(info.Url, UriKind.Absolute, out Uri? uri) && uri != null)
             {
                 var cookieManager = _downloadEngine.CoreWebView2.CookieManager;
@@ -818,16 +881,25 @@ namespace Rapid_Downloader
             if (taskListView.SelectedItems.Count == 0) return;
 
             var selectedItem = taskListView.SelectedItems[0];
-            if (selectedItem.Tag is DownloadItemState state && state.DownloadOperation != null)
-            {
-                if (state.DownloadOperation.State == CoreWebView2DownloadState.Completed) return;
+            if (selectedItem.Tag is not DownloadItemState state) return;
 
+            string status = selectedItem.SubItems[2].Text;
+            if (status == "Completed") return;
+
+            if (state.DownloadOperation != null)
+            {
                 if (state.DownloadOperation.State == CoreWebView2DownloadState.Interrupted)
                 {
-                    AppLogger.Info($"[Download Action] Resuming task: '{state.Info.FileName}'");
+                    AppLogger.Info($"[Download Action] Resuming WebView2 task: '{state.Info.FileName}'");
                     selectedItem.SubItems[2].Text = "Resuming...";
                     state.DownloadOperation.Resume();
                 }
+            }
+            else if (status == "Stopped" || status == "Error")
+            {
+                AppLogger.Info($"[Download Action] Resuming segmented task: '{state.Info.FileName}'");
+                selectedItem.SubItems[2].Text = "Resuming...";
+                LaunchSegmentedWorker(selectedItem, state);
             }
         }
 
@@ -836,13 +908,17 @@ namespace Rapid_Downloader
             if (taskListView.SelectedItems.Count == 0) return;
 
             var selectedItem = taskListView.SelectedItems[0];
-            if (selectedItem.Tag is DownloadItemState state && state.DownloadOperation != null)
+            if (selectedItem.Tag is not DownloadItemState state) return;
+
+            if (state.DownloadOperation != null && state.DownloadOperation.State == CoreWebView2DownloadState.InProgress)
             {
-                if (state.DownloadOperation.State == CoreWebView2DownloadState.InProgress)
-                {
-                    AppLogger.Info($"[Download Action] Pausing task: '{state.Info.FileName}'");
-                    state.DownloadOperation.Pause();
-                }
+                AppLogger.Info($"[Download Action] Pausing WebView2 task: '{state.Info.FileName}'");
+                state.DownloadOperation.Pause();
+            }
+            else if (state.Cts != null && !state.Cts.IsCancellationRequested)
+            {
+                AppLogger.Info($"[Download Action] Pausing segmented task: '{state.Info.FileName}'");
+                state.Cts.Cancel();
             }
         }
 
@@ -851,13 +927,13 @@ namespace Rapid_Downloader
             AppLogger.Info($"[Download Action] Stop All triggered across {_allDownloadItems.Count} total task(s).");
             foreach (var item in _allDownloadItems)
             {
-                if (item.Tag is DownloadItemState state && state.DownloadOperation != null)
-                {
-                    if (state.DownloadOperation.State == CoreWebView2DownloadState.InProgress)
-                    {
-                        state.DownloadOperation.Pause();
-                    }
-                }
+                if (item.Tag is not DownloadItemState state) continue;
+
+                if (state.DownloadOperation != null && state.DownloadOperation.State == CoreWebView2DownloadState.InProgress)
+                    state.DownloadOperation.Pause();
+
+                if (state.Cts != null && !state.Cts.IsCancellationRequested)
+                    state.Cts.Cancel();
             }
         }
 
@@ -921,7 +997,14 @@ namespace Rapid_Downloader
 
         private void BtnOptions_Click(object? sender, EventArgs e)
         {
-            MessageBox.Show("Configuration dialog triggered", "Options");
+            AppLogger.Info("[UI Action] Options dialog clicked.");
+            using var optionsDlg = new OptionsForm(this.Icon);
+            if (optionsDlg.ShowDialog(this) == DialogResult.OK)
+            {
+                // Refresh category tree in case categories were added/renamed/deleted
+                InitializeCategoriesTree();
+                ApplyCategoryFilter();
+            }
         }
 
         protected override void OnFormClosed(FormClosedEventArgs e)

@@ -1,4 +1,5 @@
 ﻿using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Text.Json.Nodes;
 using System.Threading;
@@ -26,12 +27,24 @@ namespace Rapid_Downloader
                     "RapidDownloader_SharedProfile"
                 );
 
-                // Configure Chromium preference to ALWAYS download PDFs instead of opening in viewer
                 ConfigureAlwaysDownloadPdf(userDataFolder);
+
+                var browserArgs = new List<string>
+                {
+                    "--disable-features=PdfViewer,EdgeNewPDFViewer"
+                };
+
+                string dohTemplate = AppSettings.Current.GetActiveDohTemplate();
+                if (!string.IsNullOrWhiteSpace(dohTemplate))
+                {
+                    browserArgs.Add("--dns-over-https-mode=secure");
+                    browserArgs.Add($"--dns-over-https-templates=\"{dohTemplate}\"");
+                    AppLogger.Info($"[WebView2] Configuring secure DNS-over-HTTPS: {dohTemplate}");
+                }
 
                 var options = new CoreWebView2EnvironmentOptions
                 {
-                    AdditionalBrowserArguments = "--disable-features=PdfViewer,EdgeNewPDFViewer"
+                    AdditionalBrowserArguments = string.Join(" ", browserArgs)
                 };
 
                 _environment = await CoreWebView2Environment.CreateAsync(null, userDataFolder, options);

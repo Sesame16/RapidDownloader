@@ -314,21 +314,7 @@ namespace Rapid_Downloader
 
         public static string CategorizeExtension(string extension)
         {
-            string ext = extension.ToLowerInvariant();
-
-            string[] archived = { ".zip", ".rar", ".7z", ".tar", ".gz", ".bz2", ".iso", ".xz", ".cab" };
-            if (archived.Contains(ext)) return "Archived";
-
-            string[] media = { ".mp3", ".wav", ".aac", ".flac", ".mp4", ".mkv", ".avi", ".mov", ".flv", ".webm", ".jpg", ".jpeg", ".png", ".gif", ".webp" };
-            if (media.Contains(ext)) return "Media";
-
-            string[] applications = { ".exe", ".msi", ".bat", ".cmd", ".apk", ".dmg", ".pkg", ".appimage" };
-            if (applications.Contains(ext)) return "Applications";
-
-            string[] documents = { ".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx", ".txt", ".rtf", ".odt", ".csv" };
-            if (documents.Contains(ext)) return "Documents";
-
-            return "Others";
+            return AppSettings.Current.GetCategoryForExtension(extension);
         }
     }
 
